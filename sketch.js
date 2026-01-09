@@ -56,6 +56,12 @@ let lockedRectB = null;
 // ✅ 在全局变量区添加，用于锁定 3D 模型的位置
 let lockedHit = null;
 
+// ===== Marker AR params =====
+const MARKER_SIZE_M = 0.06; // marker 实际边长（米）: 6cm，按你打印的真实尺寸改
+let markerPose = null;      // { rvec, tvec, R } 缓存
+let markerVisible = false;  // 是否检测到
+
+
 function updateStable(st, obj) {
   if (!obj) {
     st.lost++;
@@ -93,35 +99,41 @@ function toggleLock() {
   lockMode = !lockMode;
 
   if (lockMode) {
+    // 1) 锁定物种/材质（来自 stable）
     lockedA = (stableA.name && stableA.count >= STABLE_FRAMES)
       ? { organism: stableA.name, feats: stableA.feats }
       : null;
+
     lockedB = (stableB.name && stableB.count >= STABLE_FRAMES)
       ? { organism: stableB.name, feats: stableB.feats }
       : null;
 
+    // 2) 锁定检测框（来自 track）
     lockedRectA = trackA ? { ...trackA } : null;
     lockedRectB = trackB ? { ...trackB } : null;
 
-    // --- ✅ 新增：在锁定时保存当前的 3D 坐标 ---
+    // 3) 锁定 3D 世界坐标点（来自当下 spawn2D）
     const boxSize = Math.floor(Math.min(width, height) * 0.85);
     const bx = Math.floor((width - boxSize) / 2);
     const by = Math.floor((height - boxSize) / 2);
+
     const spawnX = (spawn2D && spawn2D.ok) ? spawn2D.x : (bx + boxSize / 2);
     const spawnY = (spawn2D && spawn2D.ok) ? spawn2D.y : (by + boxSize / 2);
-    
-    // 计算当前的地面交点并保存到全局变量
+
     lockedHit = screenToGround(spawnX, spawnY);
-    // ---------------------------------------
 
     if (lockBtn) lockBtn.html("Locked ✅ (tap to unlock)");
   } else {
-    lockedA = null; lockedB = null;
-    lockedRectA = null; lockedRectB = null;
-    lockedHit = null; // ✅ 解锁时清除
+    lockedA = null;
+    lockedB = null;
+    lockedRectA = null;
+    lockedRectB = null;
+    lockedHit = null;
+
     if (lockBtn) lockBtn.html("Lock / Unlock");
   }
 }
+
 
 
 // =====================
@@ -472,6 +484,44 @@ const by = Math.floor((height - boxSize) / 2);
     return;
   }
 
+  // cvReady 通过后：
+if (lockMode) {
+  // lock 后不再跑 OpenCV，不再更新 spawn，不再更新 boxes
+  // 只渲染 three：用 lockedHit + lockedA/B
+
+  if (three.ready) {
+    const finalHit = lockedHit;
+
+    if (lockedA) {
+      const instA = ensureInstanceForSlot("A", lockedA.organism);
+      if (instA && finalHit) {
+        applyAppearanceToModel(instA, makeAppearance(lockedA.feats, lockedA.organism));
+        instA.visible = true;
+        instA.position.copy(finalHit);
+      }
+    } else if (three.instA) three.instA.visible = false;
+
+    if (lockedB) {
+      const instB = ensureInstanceForSlot("B", lockedB.organism);
+      if (instB && finalHit) {
+        applyAppearanceToModel(instB, makeAppearance(lockedB.feats, lockedB.organism));
+        instB.visible = true;
+        instB.position.copy(finalHit);
+      }
+    } else if (three.instB) three.instB.visible = false;
+
+    // 相机姿态持续更新（你转手机就能“看”它）
+    let a = THREE.MathUtils.degToRad(rawOrientation.alpha);
+    let b = THREE.MathUtils.degToRad(rawOrientation.beta);
+    let g = THREE.MathUtils.degToRad(rawOrientation.gamma);
+    three.camera.rotation.set(b, a, -g, 'YXZ');
+    three.renderer.render(three.scene, three.camera);
+  }
+
+  // ✅ lock 时直接结束 draw
+  return;
+}
+
  // ✅ ROI 真实识别尺寸：限制在 cam 内（不要跟 boxSize 一样大）
 const roiSize = Math.min(320, cam.width, cam.height); // 你也可以试 240/280/320
 
@@ -540,6 +590,33 @@ const roi = cam.get(
   const assigned = assignToTracks(topRects, trackA, trackB);
   trackA = smoothRect(trackA, assigned.A, SMOOTH);
   trackB = smoothRect(trackB, assigned.B, SMOOTH);
+
+// ===== Marker pose update (每帧都做，lock 也要做) =====
+markerVisible = false;
+
+const quad = findMarkerQuad(src);
+if (quad) {
+  markerVisible = true;
+
+  // 如果 src 是 ROI，你的相机内参应该用 ROI 尺寸
+  const pose = estimatePoseFromQuad(quad, src.cols, src.rows);
+
+  if (pose) {
+    // 清理上一帧 pose，避免内存泄漏
+    if (markerPose) {
+      markerPose.rvec.delete();
+      markerPose.tvec.delete();
+      markerPose.R.delete();
+    }
+    markerPose = pose;
+
+    applyPoseToThreeCamera(markerPose);
+  }
+}
+fill(255);
+textSize(14);
+text(`marker: ${markerVisible}`, 20, 110);
+
 
 // 修改为：
 if (!lockMode) {
@@ -659,54 +736,46 @@ if (!lockMode) {
 
 // F) Apply model + material + position (A & B) —— 用“稳定结果 / 锁定结果”
 if (three.ready) {
-
   let finalHit = null;
 
+  // 1. 先统一定义当前的生成坐标 (不论是否锁定都需要这个逻辑来计算位置)
+  const currentSpawnX = (spawn2D && spawn2D.ok) ? spawn2D.x : (bx + boxSize / 2);
+  const currentSpawnY = (spawn2D && spawn2D.ok) ? spawn2D.y : (by + boxSize / 2);
+
   if (lockMode) {
-    // ✅ 锁定模式：直接使用保存好的位置，不再计算
+    // ✅ 锁定模式：直接使用保存好的位置
     finalHit = lockedHit;
   } else {
-    // 1) 未锁定：统一 spawn 点（优先 spawn2D；否则扫描框中心）
-    const spawnX = (spawn2D && spawn2D.ok) ? spawn2D.x : (bx + boxSize / 2);
-    const spawnY = (spawn2D && spawn2D.ok) ? spawn2D.y : (by + boxSize / 2);
-
-    // 2) 地面交点：实时计算
-    finalHit = screenToGround(spawnX, spawnY);
+    // 2) 未锁定：实时计算地面交点
+    finalHit = screenToGround(currentSpawnX, currentSpawnY);
   }
 
-  // 3) 当前要展示的 A/B 逻辑保持不变...
-  const showA = lockMode
-    ? lockedA
-    : ((stableA.name && stableA.count >= STABLE_FRAMES) ? { organism: stableA.name, feats: stableA.feats } : null);
+  // 3) 确定要显示的 A/B 逻辑
+  const showA = lockMode ? lockedA : ((stableA.name && stableA.count >= STABLE_FRAMES) ? { organism: stableA.name, feats: stableA.feats } : null);
+  const showB = lockMode ? lockedB : ((stableB.name && stableB.count >= STABLE_FRAMES) ? { organism: stableB.name, feats: stableB.feats } : null);
 
-  const showB = lockMode
-    ? lockedB
-    : ((stableB.name && stableB.count >= STABLE_FRAMES) ? { organism: stableB.name, feats: stableB.feats } : null);
-
-  // === A ===
+  // === 应用位置到 A ===
   if (showA) {
     const instA = ensureInstanceForSlot("A", showA.organism);
     if (instA) {
       applyAppearanceToModel(instA, makeAppearance(showA.feats, showA.organism));
       instA.visible = true;
-      // ✅ 使用 finalHit
-      if (finalHit) instA.position.set(finalHit.x, finalHit.y + 0.05, finalHit.z);
+      if (finalHit) instA.position.copy(finalHit);
     }
-  } else {
-    if (three.instA) three.instA.visible = false;
+  } else if (three.instA) {
+    three.instA.visible = false;
   }
 
-  // === B ===
+  // === 应用位置到 B ===
   if (showB) {
     const instB = ensureInstanceForSlot("B", showB.organism);
     if (instB) {
       applyAppearanceToModel(instB, makeAppearance(showB.feats, showB.organism));
       instB.visible = true;
-      // ✅ 使用 finalHit
-      if (finalHit) instB.position.set(finalHit.x, finalHit.y + 0.05, finalHit.z);
+      if (finalHit) instB.position.copy(finalHit);
     }
-  } else {
-    if (three.instB) three.instB.visible = false;
+  } else if (three.instB) {
+    three.instB.visible = false;
   }
 }
 
@@ -736,38 +805,23 @@ if (three.ready) {
   // Render three
   if (three.ready) three.renderer.render(three.scene, three.camera);
 
-  // cleanup OpenCV mats
+// === 统一旋转和最终渲染 (放在 draw 结束前最后一步) ===
+  if (three.ready) {
+    let a = THREE.MathUtils.degToRad(rawOrientation.alpha);
+    let b = THREE.MathUtils.degToRad(rawOrientation.beta);
+    let g = THREE.MathUtils.degToRad(rawOrientation.gamma);
+    
+    // YXZ 顺序对手机陀螺仪最友好
+    three.camera.rotation.set(b, a, -g, 'YXZ');
+    three.renderer.render(three.scene, three.camera);
+  }
+
+  // 清理 OpenCV 内存
   src.delete();
   gray.delete();
   edges.delete();
+} // 这是 draw 函数的结束括号
 
-  // 在 draw() 的末尾添加
-fill(255, 0, 0);
-textSize(20);
-
-if (three.instA) {
-  const p = three.instA.position;
-  text(`A: ${three.instA.userData._organismName || "?"}`, 20, 120);
-  text(`A Pos: ${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`, 20, 140);
-}
-if (three.instB) {
-  const p2 = three.instB.position;
-  text(`B: ${three.instB.userData._organismName || "?"}`, 20, 170);
-  text(`B Pos: ${p2.x.toFixed(2)}, ${p2.y.toFixed(2)}, ${p2.z.toFixed(2)}`, 20, 190);
-}
-
-
-if (three.ready) {
-  // 简单的旋转同步逻辑
-  let a = THREE.MathUtils.degToRad(rawOrientation.alpha);
-  let b = THREE.MathUtils.degToRad(rawOrientation.beta);
-  let g = THREE.MathUtils.degToRad(rawOrientation.gamma);
-  
-  three.camera.rotation.set(b, a, -g, 'YXZ');
-  three.renderer.render(three.scene, three.camera);
-}
-
-}
 
 function windowResized() {
   resizeCanvas(windowWidth, windowHeight);
@@ -1119,7 +1173,6 @@ function applyAppearanceToModel(model, app) {
 }
 
 function screenToGround(sx, sy) {
-  // 1. 确保 ndc 坐标计算准确
   const mouse = new THREE.Vector2();
   mouse.x = (sx / window.innerWidth) * 2 - 1;
   mouse.y = -(sy / window.innerHeight) * 2 + 1;
@@ -1127,17 +1180,183 @@ function screenToGround(sx, sy) {
   const raycaster = new THREE.Raycaster();
   raycaster.setFromCamera(mouse, three.camera);
 
-  // 2. 创建一个虚拟的“前方”平面，防止射线射向无穷远
-  // 即使没击中 ground 平面，也让模型出现在相机前方 2 个单位处
   const targetPoint = new THREE.Vector3();
-  const ok = raycaster.ray.intersectPlane(three.ground, targetPoint);
+  // 关键：在 3D 空间中寻找射线与 Y=0 平面（地面）的交点
+  const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  const ok = raycaster.ray.intersectPlane(groundPlane, targetPoint);
   
   if (ok) {
     return targetPoint;
   } else {
-    // 兜底方案：如果没算到地面，把模型放在相机正前方
+    // 如果没射到地面，就放在相机前方 3 米远的世界坐标点
     const fallback = new THREE.Vector3();
-    raycaster.ray.at(2, fallback); 
+    raycaster.ray.at(3, fallback); 
     return fallback;
   }
+}
+
+function orderCorners(pts) {
+  // pts: [{x,y} * 4]
+  // 按 TL, TR, BR, BL 排序
+  const sum = pts.map(p => p.x + p.y);
+  const diff = pts.map(p => p.x - p.y);
+
+  const tl = pts[sum.indexOf(Math.min(...sum))];
+  const br = pts[sum.indexOf(Math.max(...sum))];
+  const tr = pts[diff.indexOf(Math.max(...diff))];
+  const bl = pts[diff.indexOf(Math.min(...diff))];
+
+  return [tl, tr, br, bl];
+}
+
+function findMarkerQuad(srcRGBA) {
+  // srcRGBA: cv.Mat RGBA
+  const gray = new cv.Mat();
+  cv.cvtColor(srcRGBA, gray, cv.COLOR_RGBA2GRAY);
+
+  const blur = new cv.Mat();
+  cv.GaussianBlur(gray, blur, new cv.Size(5,5), 0);
+
+  const edges = new cv.Mat();
+  cv.Canny(blur, edges, 60, 160);
+
+  const contours = new cv.MatVector();
+  const hierarchy = new cv.Mat();
+  cv.findContours(edges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  let best = null;
+  let bestArea = 0;
+
+  for (let i = 0; i < contours.size(); i++) {
+    const cnt = contours.get(i);
+    const area = cv.contourArea(cnt);
+    if (area < 1500) { cnt.delete(); continue; }
+
+    const peri = cv.arcLength(cnt, true);
+    const approx = new cv.Mat();
+    cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+
+    if (approx.rows === 4 && cv.isContourConvex(approx)) {
+      // 取四个点
+      const pts = [];
+      for (let k = 0; k < 4; k++) {
+        const x = approx.intAt(k, 0);
+        const y = approx.intAt(k, 1);
+        pts.push({ x, y });
+      }
+
+      // 粗略筛选：接近正方形（宽高比）
+      const rect = cv.boundingRect(approx);
+      const ratio = rect.width / rect.height;
+      if (ratio > 0.7 && ratio < 1.3) {
+        if (area > bestArea) {
+          bestArea = area;
+          best = pts;
+        }
+      }
+    }
+
+    approx.delete();
+    cnt.delete();
+  }
+
+  gray.delete(); blur.delete(); edges.delete();
+  contours.delete(); hierarchy.delete();
+
+  if (!best) return null;
+  return orderCorners(best); // TL TR BR BL
+}
+
+function buildCameraMatrix(w, h, fovDeg = 60) {
+  // 用 three 的 FOV 近似相机内参
+  const fov = (fovDeg * Math.PI) / 180;
+  const fy = (h / 2) / Math.tan(fov / 2);
+  const fx = fy;
+  const cx = w / 2;
+  const cy = h / 2;
+
+  const K = cv.matFromArray(3, 3, cv.CV_64F, [
+    fx, 0,  cx,
+    0,  fy, cy,
+    0,  0,  1
+  ]);
+  return K;
+}
+
+function estimatePoseFromQuad(quad, imgW, imgH) {
+  // quad: TL TR BR BL, in image pixel coords
+  const half = MARKER_SIZE_M / 2;
+
+  // marker 在自身坐标系的 4 个角（单位：米）
+  const objPts = cv.matFromArray(4, 3, cv.CV_64F, [
+    -half,  half, 0,   // TL
+     half,  half, 0,   // TR
+     half, -half, 0,   // BR
+    -half, -half, 0    // BL
+  ]);
+
+  const imgPts = cv.matFromArray(4, 2, cv.CV_64F, [
+    quad[0].x, quad[0].y,
+    quad[1].x, quad[1].y,
+    quad[2].x, quad[2].y,
+    quad[3].x, quad[3].y
+  ]);
+
+  const K = buildCameraMatrix(imgW, imgH, 60);
+  const dist = cv.Mat.zeros(4, 1, cv.CV_64F); // 先假设无畸变
+
+  const rvec = new cv.Mat();
+  const tvec = new cv.Mat();
+
+  const ok = cv.solvePnP(objPts, imgPts, K, dist, rvec, tvec, false, cv.SOLVEPNP_ITERATIVE);
+
+  objPts.delete(); imgPts.delete(); K.delete(); dist.delete();
+
+  if (!ok) { rvec.delete(); tvec.delete(); return null; }
+
+  // rvec -> R
+  const R = new cv.Mat();
+  cv.Rodrigues(rvec, R);
+
+  return { rvec, tvec, R };
+}
+
+// OpenCV坐标 -> Three坐标 纠正矩阵（y翻转 + z翻转）
+const CV_TO_THREE = new THREE.Matrix4().set(
+  1, 0, 0, 0,
+  0,-1, 0, 0,
+  0, 0,-1, 0,
+  0, 0, 0, 1
+);
+
+function applyPoseToThreeCamera(pose) {
+  const R = pose.R;    // 3x3
+  const t = pose.tvec; // 3x1
+
+  const r00 = R.doubleAt(0,0), r01 = R.doubleAt(0,1), r02 = R.doubleAt(0,2);
+  const r10 = R.doubleAt(1,0), r11 = R.doubleAt(1,1), r12 = R.doubleAt(1,2);
+  const r20 = R.doubleAt(2,0), r21 = R.doubleAt(2,1), r22 = R.doubleAt(2,2);
+
+  const tx = t.doubleAt(0,0);
+  const ty = t.doubleAt(1,0);
+  const tz = t.doubleAt(2,0);
+
+  // OpenCV: X右 Y下 Z前
+  const mCV = new THREE.Matrix4().set(
+    r00, r01, r02, tx,
+    r10, r11, r12, ty,
+    r20, r21, r22, tz,
+    0,   0,   0,   1
+  );
+
+  // 转到 three 坐标
+  const mThree = new THREE.Matrix4().multiplyMatrices(CV_TO_THREE, mCV);
+
+  // 这里我们让 camera 跟随 pose（camera 相对 marker）
+  three.camera.matrixAutoUpdate = false;
+  three.camera.matrix.copy(mThree);
+
+  // three 需要更新 inverse
+  three.camera.matrixWorld.copy(three.camera.matrix);
+  three.camera.matrixWorldInverse.copy(three.camera.matrix).invert();
 }
