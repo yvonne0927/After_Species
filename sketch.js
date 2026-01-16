@@ -11,6 +11,11 @@ let modelError = "";
 let loadedCount = 0;
 let totalCount = 0;
 
+// ===== UI hint: rotate =====
+const ROTATE_HINT = "Touch & drag: rotate the organism";
+let SHOW_ROTATE_HINT = true; // 想随时关就 false
+
+
 // ✅ freeze cache：用于 lock 后保持“按下那一刻的画面数据”
 let freeze = {
   roi: null,          // p5.Image（小缩略图）
@@ -21,6 +26,14 @@ let freeze = {
 
 let currentMatType = "none";
 let currentMatInfo = "";
+
+// ===== UI fold (debug panel) =====
+let uiState = {
+  collapsed: true,   // 默认折叠
+  showN: 5           // 折叠时显示前 N 行
+};
+let uiToggleBtn;
+
 
 // ===== Drag rotate controls (mouse + touch) =====
 let dragCtrl = {
@@ -202,6 +215,7 @@ function toggleLock() {
     const boxSize = Math.floor(Math.min(width, height) * 0.85);
     const bx = Math.floor((width - boxSize) / 2);
     const by = Math.floor((height - boxSize) / 2);
+
 
     const sx = (spawn2D && spawn2D.ok) ? spawn2D.x : (bx + boxSize / 2);
     const sy = (spawn2D && spawn2D.ok) ? spawn2D.y : (by + boxSize / 2);
@@ -462,6 +476,17 @@ function setup() {
    lockBtn.style('position', 'fixed');
    lockBtn.style('z-index', '9999');
 
+   uiToggleBtn = createButton("UI: Collapsed ▾");
+uiToggleBtn.position(20, 120);
+uiToggleBtn.size(160, 36);
+uiToggleBtn.mousePressed(() => {
+  uiState.collapsed = !uiState.collapsed;
+  uiToggleBtn.html(uiState.collapsed ? "UI: Collapsed ▾" : "UI: Expanded ▴");
+});
+uiToggleBtn.style('position', 'fixed');
+uiToggleBtn.style('z-index', '9999');
+
+
 }
 
 function startCamera() {
@@ -604,6 +629,31 @@ const by = Math.floor((height - boxSize) / 2);
   noFill();
   stroke(0, 255, 0);
   rect(bx, by, boxSize, boxSize);
+
+// ===== draw rotate hint (outside below the scan box) =====
+if (SHOW_ROTATE_HINT) {
+  push();
+  textFont("monospace");
+  textSize(14);
+  textAlign(CENTER, TOP);
+  noStroke();
+
+  const hintX = bx + boxSize / 2;
+  const hintY = by + boxSize + 10;
+
+  const padX = 10;
+  const padY = 6;
+  const w = textWidth(ROTATE_HINT) + padX * 2;
+  const h = 14 + padY * 2;
+
+  fill(0, 140);
+  rect(hintX - w / 2, hintY, w, h, 8);
+
+  fill(255);
+  text(ROTATE_HINT, hintX, hintY + padY);
+  pop();
+}
+
 
   fill(255);
   noStroke();
@@ -811,19 +861,19 @@ if (!lockMode && roi) {
   }
 
   // =========================
-  // D) UI panel（更小字 + 更靠左 + 背景自适应宽度）
-  // =========================
-  const uiX = 12;      // 更靠左
-  const uiY = 12;
-  const pad = 10;      // 内边距
-  const fontSize = 12; // ✅ 字变小（你也可以试 13）
-  const lineH = 16;    // 行距
+// D) UI panel (foldable)
+// =========================
+const uiX = 12;
+const uiY = 12;
+const pad = 10;
+const fontSize = 12;
+const lineH = 16;
 
-  textSize(fontSize);
-  textFont("monospace"); // 可选：更像调试UI
-  noStroke();
+textSize(fontSize);
+textFont("monospace");
+noStroke();
 
-  const safeFeats = roiFeats || {
+const safeFeats = roiFeats || {
   warmth: 0, brightness: 0, straightness: 0, texture: 0, smoothness: 0, lineCount: 0
 };
 
@@ -833,9 +883,9 @@ const safeRes = resultROI || {
   score: { Tendril: 0, GlyphLight: 0, CrystalShell: 0, Jelly: 0, SporeCloud: 0 }
 };
 
-
 const uiLines = [
   `cvReady: ${cvReady}`,
+  `marker: ${markerVisible}`,
   `edgePixels(ROI): ${edgePixels}`,
   `warmth (R-B): ${safeFeats.warmth.toFixed(1)}`,
   `brightness: ${safeFeats.brightness.toFixed(2)}`,
@@ -852,22 +902,24 @@ const uiLines = [
   `matInfo: ${currentMatInfo}`,
 ];
 
+// ✅ fold
+const drawLines = uiState.collapsed ? uiLines.slice(0, uiState.showN) : uiLines;
 
-  // ✅ 背景宽度=最长字符串宽度+padding（不会再过宽）
-  let maxW = 0;
-  for (const s of uiLines) maxW = Math.max(maxW, textWidth(s));
-  const panelW = maxW + pad * 2;
-  const panelH = uiLines.length * lineH + pad * 2;
+// 背景宽高自适应
+let maxW = 0;
+for (const s of drawLines) maxW = Math.max(maxW, textWidth(s));
+const panelW = maxW + pad * 2;
+const panelH = drawLines.length * lineH + pad * 2;
 
-  fill(0, 140); // 半透明背景
-  rect(uiX, uiY, panelW, panelH, 10);
+fill(0, 140);
+rect(uiX, uiY, panelW, panelH, 10);
 
-  fill(255);
-  let ty = uiY + pad + lineH - 4;
-  for (const s of uiLines) {
-    text(s, uiX + pad, ty);
-    ty += lineH;
-  }
+fill(255);
+let ty = uiY + pad + lineH - 4;
+for (const s of drawLines) {
+  text(s, uiX + pad, ty);
+  ty += lineH;
+}
 
   // E) draw boxes
   const scaleX = boxSize / roi.width;
